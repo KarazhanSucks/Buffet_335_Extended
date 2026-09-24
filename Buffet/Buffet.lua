@@ -3,7 +3,7 @@
 --      Locals      --
 ----------------------
 
-local defaults = {macroHP = "#showtooltip\n%MACRO%", macroMP = "#showtooltip\n%MACRO%"}
+local defaults = {macroHP = "#showtooltip\n%MACRO%", macroMP = "#showtooltip\n%MACRO%", preferSpeed = false, debug = false}
 local ids, bests, allitems, items, dirty = LibStub("tekIDmemo"), {}, {}, {
 	bandage = "38640:4100,34721:4800,34722:5800,2581:114,8545:1104,21991:3400,14530:2000,6451:640,3531:301,1251:66,8544:800,21990:2800,14529:1360,6450:400,3530:161",
 	hstone = "36892:4280,36893:4708,36894:5136,36889:3500,36890:3850,36891:4200,14894:600,25881:400,23329:24,25883:1250,25880:180,15723:1400,11951:800,25882:640,25498:96,11952:425,11951:800,5509:500,5510:800,5511:250,5512:100,9421:1200,19004:110,19005:120,19006:275,19007:300,19008:550,19009:600,19010:880,19011:960,19012:1320,19013:1440,22103:2080,22104:2288,22105:2496",
@@ -35,6 +35,124 @@ end
 for i,v in pairs(items) do bests[i], items[i] = {}, TableStuffer(string.split(" ,", v)) end
 
 
+--------------------------------
+--      Restore scanner       --
+--------------------------------
+
+-- Food and water pools that compete on restore rate when "prefer speed" is on.
+-- An item can sit in a health pool and a mana pool at once (a food-and-drink,
+-- eg 45932 or 65499), so rates are tracked per resource and never per item.
+local RATEPOOL, POOLNAME, parsed, awaiting = {}, {}, {}, {}
+local ratebest, scanMax = {health = {}, mana = {}}, {}
+local lastargs, lastsig, quiet, scanTip
+
+for kind, sets in pairs{health = {"conjfood", "percfood", "food"}, mana = {"conjwater", "percwater", "water"}} do
+	for _, set in ipairs(sets) do
+		for id in pairs(items[set]) do
+			local t = RATEPOOL[id]
+			if t then
+				t[kind] = true
+				POOLNAME[id] = POOLNAME[id]..","..set
+			else
+				RATEPOOL[id], POOLNAME[id] = {[kind] = true}, set
+			end
+		end
+	end
+end
+
+
+-- Folded to lower case so the patterns below only need one case: tooltips say
+-- "Use: Restores ..." but hand-written server text may not.
+local function Normalize(text)
+	text = text:lower()
+	text = text:gsub("\194\160", " ")     -- non-breaking space
+	text = text:gsub("%s+", " ")
+	return (text:gsub(" %%", "%%"))       -- "4 %" -> "4%"
+end
+
+
+-- enUS shapes.  One line can carry both resources:
+--   flat      "Restores 22500 health over 30 sec"                (a total, divide by duration)
+--   both      "Restores 22500 health and 19200 mana over 30 sec"
+--   percent   "Restores 4% of your health and 3% of your mana per second for 25 sec"  (already a rate)
+--   tick      "Restores 500 health every 5 sec for 25 sec"       (amount is per tick)
+local function ParseRestoreLine(text, out)
+	local dur = tonumber(text:match("for ([%d,%.]+) sec")) or tonumber(text:match("over ([%d,%.]+) sec"))
+	local tick = tonumber(text:match("every ([%d,%.]+) sec"))
+	local divisor = text:find("per second", 1, true) and 1 or tick or dur
+
+	local function Add(kind, amount, isPercent)
+		if out[kind] or not amount then return end
+		amount = tonumber((amount:gsub(",", "")))
+		if amount and amount > 0 then
+			out[kind] = {amount = amount, isPercent = isPercent or nil, divisor = divisor, dur = dur, tick = tick}
+		end
+	end
+
+	Add("health", text:match("([%d,%.]+)%% of your health"), true)
+	Add("mana", text:match("([%d,%.]+)%% of your mana"), true)
+	Add("health", text:match("restores ([%d,%.]+) health"))
+	Add("mana", text:match("restores ([%d,%.]+) mana") or text:match("and ([%d,%.]+) mana"))
+end
+
+
+local function ReadTooltip(link)
+	if not GetItemInfo(link) then return end   -- item data isn't in the client cache yet
+	if not scanTip then
+		scanTip = CreateFrame("GameTooltip", "BuffetScanTip", UIParent, "GameTooltipTemplate")
+		scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
+		scanTip:Hide()
+	end
+
+	scanTip:ClearLines()
+	scanTip:SetHyperlink(link)
+
+	local first = _G["BuffetScanTipTextLeft1"]
+	if not first or not first:GetText() or first:GetText() == RETRIEVING_ITEM_INFO then return end
+
+	local out = {lines = {}}
+	for i = 1, math.min(scanTip:NumLines() or 0, 30) do
+		local fs = _G["BuffetScanTipTextLeft"..i]
+		local raw = fs and fs:GetText()
+		if raw and raw ~= "" then
+			out.lines[#out.lines + 1] = raw
+			ParseRestoreLine(Normalize(raw), out)
+		end
+	end
+	return out
+end
+
+
+-- Never cache a failed read: a custom item whose data arrives late would then be
+-- excluded forever.  parsed[id] only ever holds a completed read, so "not there
+-- yet" simply gets another look on the next scan.
+local function ParseCandidate(id, link)
+	local out = ReadTooltip(link)
+	if not out then awaiting[id] = true return end
+	awaiting[id] = nil
+	parsed[id] = out
+end
+
+
+local function MaxFor(kind)
+	if kind == "health" then return UnitHealthMax("player") end
+	return (UnitPowerMax and UnitPowerMax("player", 0)) or (UnitManaMax and UnitManaMax("player"))
+end
+
+
+-- Percent items convert against the player's current max, so the rate is worked
+-- out at pick time and never cached.
+local function RateOf(entry, max)
+	local amount = entry.amount
+	if entry.isPercent then
+		if not max or max <= 0 then return end
+		amount = amount / 100 * max
+	end
+	if not entry.divisor or entry.divisor <= 0 then return end
+	return amount / entry.divisor
+end
+
+
 -----------------------------
 --      Event Handler      --
 -----------------------------
@@ -64,6 +182,7 @@ function Buffet:PLAYER_LOGIN()
 	self:RegisterEvent("PLAYER_REGEN_ENABLED")
 	self:RegisterEvent("BAG_UPDATE")
 	self:RegisterEvent("PLAYER_LEVEL_UP")
+	pcall(self.RegisterEvent, self, "GET_ITEM_INFO_RECEIVED")   -- not on every client
 
 	self:Scan()
 
@@ -88,10 +207,20 @@ function Buffet:BAG_UPDATE()
 end
 Buffet.PLAYER_LEVEL_UP = Buffet.BAG_UPDATE
 
+-- Item data can land after we first see something in the bags; rescan so a
+-- late arrival still gets parsed.
+function Buffet:GET_ITEM_INFO_RECEIVED()
+	if next(awaiting) then self:BAG_UPDATE() end
+end
+
 
 function Buffet:Scan()
 	for _,t in pairs(bests) do for i in pairs(t) do t[i] = nil end end
+	for _,t in pairs(ratebest) do t.id, t.rate, t.stack = nil, nil, nil end
+
 	local mylevel = UnitLevel("player")
+	local speed = self.db.preferSpeed
+	if speed then scanMax.health, scanMax.mana = MaxFor("health"), MaxFor("mana") end
 
 	for bag=0,4 do
 		for slot=1,GetContainerNumSlots(bag) do
@@ -106,13 +235,41 @@ function Buffet:Scan()
 						thisbest.id, thisbest.val, thisbest.stack = id, val, stack
 					end
 				end
+				if speed and RATEPOOL[id] then
+					if parsed[id] == nil then ParseCandidate(id, link) end
+					local entry = parsed[id]
+					if entry then
+						for kind in pairs(RATEPOOL[id]) do
+							local rate = entry[kind] and RateOf(entry[kind], scanMax[kind])
+							local best = ratebest[kind]
+							if rate and (not best.rate or best.rate < rate or best.rate == rate and best.stack > stack) then
+								best.id, best.rate, best.stack = id, rate, stack
+							end
+						end
+					end
+				end
 			end
 		end
 	end
 
-	self:Edit("AutoHP", self.db.macroHP, bests.conjfood.id or bests.percfood.id or bests.food.id or bests.hstone.id or bests.hppot.id, bests.hppot.id, bests.hstone.id, bests.bandage.id)
-	self:Edit("AutoMP", self.db.macroMP, bests.conjwater.id or bests.percwater.id or bests.water.id or bests.mstone.id or bests.mppot.id, bests.mppot.id, bests.mstone.id)
+	-- A pure substitution: with the option off, or with nothing parseable, this
+	-- is exactly the chain it has always been.
+	local hp = speed and ratebest.health.id or bests.conjfood.id or bests.percfood.id or bests.food.id
+	local mp = speed and ratebest.mana.id or bests.conjwater.id or bests.percwater.id or bests.water.id
+
+	lastargs = {hp = hp, mp = mp, hppot = bests.hppot.id, hstone = bests.hstone.id, bandage = bests.bandage.id, mppot = bests.mppot.id, mstone = bests.mstone.id}
+
+	self:Edit("AutoHP", self.db.macroHP, hp or bests.hstone.id or bests.hppot.id, bests.hppot.id, bests.hstone.id, bests.bandage.id)
+	self:Edit("AutoMP", self.db.macroMP, mp or bests.mstone.id or bests.mppot.id, bests.mppot.id, bests.mstone.id)
 	dirty = false
+
+	if self.db.debug then
+		local sig = table.concat({hp or 0, mp or 0, bests.hppot.id or 0, bests.hstone.id or 0, bests.bandage.id or 0, bests.mppot.id or 0, bests.mstone.id or 0}, ":")
+		if sig ~= lastsig then
+			lastsig = sig
+			if not quiet then self:Dump() end
+		end
+	end
 end
 
 
@@ -128,6 +285,101 @@ function Buffet:Edit(name, substring, food, pot, stone, shift)
 	if pot and stone then body = body .. "\n/castsequence [combat,nomod] reset="..(stone == 22044 and "120/" or "").."combat item:"..stone..", item:"..pot end
 
 	EditMacro(macroid, name, 1, substring:gsub("%%MACRO%%", body), 1)
+end
+
+
+------------------------------
+--      Debug reporting     --
+------------------------------
+
+local function ForEachCandidate(func)
+	for bag=0,4 do
+		for slot=1,GetContainerNumSlots(bag) do
+			local link = GetContainerItemLink(bag, slot)
+			local id = link and ids[link]
+			if id and allitems[id] then
+				func(id, link, select(2, GetContainerItemInfo(bag, slot)))
+			end
+		end
+	end
+end
+
+
+local function RateString(id, kind)
+	local entry = parsed[id] and parsed[id][kind]
+	if not entry then return "-" end
+	local rate = RateOf(entry, scanMax[kind])
+	if not rate then return "no duration" end
+	return string.format("%.1f/s", rate)
+end
+
+
+function Buffet:Dump()
+	scanMax.health, scanMax.mana = MaxFor("health"), MaxFor("mana")
+
+	local cands = {}
+	ForEachCandidate(function(id, link, stack) cands[#cands+1] = {id = id, link = link, stack = stack} end)
+
+	self:Print("prefer speed "..(self.db.preferSpeed and "ON" or "OFF").." | level "..UnitLevel("player").." | maxHP "..tostring(scanMax.health).." | maxMP "..tostring(scanMax.mana)..(InCombatLockdown() and " | in combat, macros not rescanned" or ""))
+
+	for _, c in ipairs(cands) do
+		if RATEPOOL[c.id] then
+			local entry, state = parsed[c.id]
+			if awaiting[c.id] then state = "awaiting item data"
+			elseif not entry then state = "not attempted"
+			elseif not (entry.health or entry.mana) then state = "no restore line"
+			else
+				local bits = {}
+				for _, kind in ipairs{"health", "mana"} do
+					local e = entry[kind]
+					if e then
+						local shape = e.divisor == 1 and "per second" or (e.tick and "every "..e.tick.."s" or "over "..tostring(e.divisor or "?").."s")
+						bits[#bits+1] = string.format("%s %s%s %s", kind, e.amount, e.isPercent and "%" or "", shape)
+					end
+				end
+				state = table.concat(bits, ", ")
+			end
+			self:Print(string.format("#%d %s x%d [%s] %s | hp %s | mp %s", c.id, GetItemInfo(c.link) or "?", c.stack, POOLNAME[c.id], state, RateString(c.id, "health"), RateString(c.id, "mana")))
+			if entry and not (entry.health or entry.mana) then
+				for _, line in ipairs(entry.lines) do self:Print("    | "..line) end
+			end
+		end
+	end
+
+	for _, kind in ipairs{"health", "mana"} do
+		local ranked = {}
+		for _, c in ipairs(cands) do
+			local rp = RATEPOOL[c.id]
+			local entry = rp and rp[kind] and parsed[c.id] and parsed[c.id][kind]
+			local rate = entry and RateOf(entry, scanMax[kind])
+			if rate then ranked[#ranked+1] = {id = c.id, rate = rate} end
+		end
+		table.sort(ranked, function(a, b) return a.rate > b.rate end)
+		local bits = {}
+		for i = 1, math.min(#ranked, 4) do bits[#bits+1] = string.format("#%d %.1f/s", ranked[i].id, ranked[i].rate) end
+		self:Print(kind.." by rate: "..(#bits > 0 and table.concat(bits, " > ") or "(nothing parseable)"))
+	end
+
+	self:Print("legacy order: hp "..tostring(bests.conjfood.id or bests.percfood.id or bests.food.id).." | mp "..tostring(bests.conjwater.id or bests.percwater.id or bests.water.id))
+	if lastargs then
+		self:Print(string.format("picked: food %s pot %s stone %s bandage %s | water %s mstone %s mppot %s",
+			tostring(lastargs.hp), tostring(lastargs.hppot), tostring(lastargs.hstone), tostring(lastargs.bandage),
+			tostring(lastargs.mp), tostring(lastargs.mstone), tostring(lastargs.mppot)))
+	end
+end
+
+
+SLASH_BUFFET1 = "/buffet"
+SlashCmdList["BUFFET"] = function(msg)
+	if string.lower(msg or "") == "debug" then
+		Buffet.db.debug = not Buffet.db.debug
+		lastsig = nil
+		Buffet:Print("debug output "..(Buffet.db.debug and "on" or "off"))
+	end
+	quiet = true
+	Buffet:BAG_UPDATE()
+	quiet = false
+	Buffet:Dump()
 end
 
 

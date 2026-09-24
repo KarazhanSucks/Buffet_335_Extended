@@ -36,6 +36,28 @@ frame:SetScript("OnShow", function()
 	mpbutt:SetScript("OnClick", OnClick)
 	if InCombatLockdown() then mpbutt:Disable() end
 
+	local speedbutt = CreateFrame("CheckButton", nil, frame)
+	speedbutt:SetWidth(20)
+	speedbutt:SetHeight(20)
+	speedbutt:SetPoint("LEFT", mpbutt, "RIGHT", GAP*2, 0)
+	speedbutt:SetNormalTexture("Interface\\Buttons\\UI-CheckBox-Up")
+	speedbutt:SetPushedTexture("Interface\\Buttons\\UI-CheckBox-Down")
+	speedbutt:SetHighlightTexture("Interface\\Buttons\\UI-CheckBox-Highlight")
+	speedbutt:GetHighlightTexture():SetBlendMode("ADD")
+	speedbutt:SetCheckedTexture("Interface\\Buttons\\UI-CheckBox-Check")
+	speedbutt:SetChecked(Buffet.db.preferSpeed and true or false)
+	speedbutt.tiptext = "Pick the fastest item you carry rather than the one that restores the most: food and water are ranked by restore per second, and percent-restore items compete directly with flat ones. Health stones, potions and bandages are unaffected."
+	speedbutt:SetScript("OnClick", function(self)
+		Buffet.db.preferSpeed = self:GetChecked() and true or false
+		Buffet:BAG_UPDATE()
+	end)
+	speedbutt:SetScript("OnEnter", mpbutt:GetScript("OnEnter"))
+	speedbutt:SetScript("OnLeave", mpbutt:GetScript("OnLeave"))
+
+	local speedlabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	speedlabel:SetText("Prefer speed")
+	speedlabel:SetPoint("LEFT", speedbutt, "RIGHT", 4, 0)
+
 	local hpmacrolabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	hpmacrolabel:SetText("HP Macro")
 	hpmacrolabel:SetPoint("TOPLEFT", hpbutt, "BOTTOMLEFT", 5, -GAP)
