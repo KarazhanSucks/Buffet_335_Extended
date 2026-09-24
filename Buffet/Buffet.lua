@@ -91,8 +91,20 @@ local function ParseRestoreLine(text, out)
 
 	Add("health", text:match("([%d,%.]+)%% of your health") or text:match("([%d,%.]+)%% of health"), true)
 	Add("mana", text:match("([%d,%.]+)%% of your mana") or text:match("([%d,%.]+)%% of mana"), true)
-	Add("health", text:match("restores ([%d,%.]+) health"))
-	Add("mana", text:match("restores ([%d,%.]+) mana") or text:match("and ([%d,%.]+) mana"))
+
+	-- One percentage covering both, as this server words the bathwater: "restoring
+	-- 4% of your health and mana per second".  After the specific patterns, so a
+	-- tooltip naming two different percentages still wins.
+	local both = text:match("([%d,%.]+)%% of your health and mana")
+		or text:match("([%d,%.]+)%% of your mana and health")
+		or text:match("([%d,%.]+)%% of health and mana")
+		or text:match("([%d,%.]+)%% of mana and health")
+	Add("health", both, true)
+	Add("mana", both, true)
+
+	-- "restores", "restoring", "restored" — the usual word varies by server.
+	Add("health", text:match("restor%a* ([%d,%.]+) health"))
+	Add("mana", text:match("restor%a* ([%d,%.]+) mana") or text:match("and ([%d,%.]+) mana"))
 end
 
 
