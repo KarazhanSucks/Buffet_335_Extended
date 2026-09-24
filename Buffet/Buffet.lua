@@ -96,39 +96,79 @@ local function ParseRestoreLine(text, out)
 end
 
 
-local function ReadTooltip(link)
-	if not GetItemInfo(link) then return end   -- item data isn't in the client cache yet
-	if not scanTip then
-		scanTip = CreateFrame("GameTooltip", "BuffetScanTip", UIParent, "GameTooltipTemplate")
-		scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
-		scanTip:Hide()
-	end
-
+-- Owner, clear, link: the order scanning tooltips use everywhere, owner first
+-- because setting one clears the tooltip.  It is shown for the length of this
+-- call only and hidden again before anything is parsed, so a bad tooltip can't
+-- strand itself on screen, and nothing is ever drawn (frames render after the
+-- current execution finishes, by which point it is hidden again).
+local function TooltipLines(link)
+	scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
 	scanTip:ClearLines()
 	scanTip:SetHyperlink(link)
+	scanTip:Show()
 
-	local first = _G["BuffetScanTipTextLeft1"]
-	if not first or not first:GetText() or first:GetText() == RETRIEVING_ITEM_INFO then return end
-
-	local out = {lines = {}}
-	for i = 1, math.min(scanTip:NumLines() or 0, 30) do
-		local fs = _G["BuffetScanTipTextLeft"..i]
+	local lines, name = {}, scanTip:GetName()
+	local n = math.min(scanTip:NumLines() or 0, 30)
+	for i = 1, n do
+		local fs = _G[name.."TextLeft"..i]
 		local raw = fs and fs:GetText()
-		if raw and raw ~= "" then
-			out.lines[#out.lines + 1] = raw
-			ParseRestoreLine(Normalize(raw), out)
+		if raw and raw ~= "" then lines[#lines + 1] = raw end
+	end
+
+	local regions = {scanTip:GetRegions()}
+	if #lines == 0 then
+		-- Some clients don't name or keep every line (TextLeft9+ come and go), so
+		-- fall back to walking the tooltip's font strings directly.
+		for i = 1, #regions do
+			local fs = regions[i]
+			if fs.GetObjectType and fs:GetObjectType() == "FontString" then
+				local raw = fs:GetText()
+				if raw and raw ~= "" then lines[#lines + 1] = raw end
+			end
 		end
 	end
+	scanTip:Hide()
+	return lines, n, #regions
+end
+
+
+local function ReadTooltip(link)
+	if not GetItemInfo(link) then return nil, "no item data" end
+
+	if not scanTip then
+		scanTip = CreateFrame("GameTooltip", "BuffetScanTip", UIParent, "GameTooltipTemplate")
+	end
+
+	-- A server-invented item whose link the client's own tooltip code chokes on
+	-- must not take the whole scan down with it, so the read is guarded and the
+	-- error comes back as the reason instead.
+	local ok, lines, n, regions = pcall(TooltipLines, link)
+	if not ok then
+		pcall(scanTip.Hide, scanTip)
+		return nil, "scan error: "..tostring(lines)
+	end
+
+	if #lines == 0 then return nil, "tooltip empty ("..n.." lines, "..regions.." regions)" end
+
+	-- The notice stands alone when the client doesn't know the name yet, and sits
+	-- under the name when it does, so look for it anywhere.  No real item
+	-- description contains that string.
+	for i = 1, #lines do
+		if lines[i] == RETRIEVING_ITEM_INFO then return nil, "retrieving item data" end
+	end
+
+	local out = {lines = lines}
+	for i = 1, #lines do ParseRestoreLine(Normalize(lines[i]), out) end
 	return out
 end
 
 
 -- Never cache a failed read: a custom item whose data arrives late would then be
--- excluded forever.  parsed[id] only ever holds a completed read, so "not there
--- yet" simply gets another look on the next scan.
+-- excluded forever.  parsed[id] only ever holds a completed read, and awaiting[id]
+-- carries the reason so the dump can say what went wrong.
 local function ParseCandidate(id, link)
-	local out = ReadTooltip(link)
-	if not out then awaiting[id] = true return end
+	local out, why = ReadTooltip(link)
+	if not out then awaiting[id] = why or "unreadable" return end
 	awaiting[id] = nil
 	parsed[id] = out
 end
@@ -322,10 +362,18 @@ function Buffet:Dump()
 
 	self:Print("prefer speed "..(self.db.preferSpeed and "ON" or "OFF").." | level "..UnitLevel("player").." | maxHP "..tostring(scanMax.health).." | maxMP "..tostring(scanMax.mana)..(InCombatLockdown() and " | in combat, macros not rescanned" or ""))
 
+	-- Control read: the hearthstone, an item every client has.  If this comes back
+	-- empty as well then the tooltip can't be read at all on this client, rather
+	-- than something being wrong with the item links, and no amount of pattern
+	-- fiddling will help.  It settles in one command what is otherwise guesswork.
+	local ctrllink = select(2, GetItemInfo(6948)) or "|cffffffff|Hitem:6948:0:0:0:0:0:0:0|h[Hearthstone]|h|r"
+	local clines, cwhy = ReadTooltip(ctrllink)
+	self:Print("control read (hearthstone): "..(clines and (#clines.lines.." lines, first = "..tostring(clines.lines[1])) or ("failed, "..tostring(cwhy))))
+
 	for _, c in ipairs(cands) do
 		if RATEPOOL[c.id] then
 			local entry, state = parsed[c.id]
-			if awaiting[c.id] then state = "awaiting item data"
+			if awaiting[c.id] then state = "awaiting, "..awaiting[c.id]
 			elseif not entry then state = "not attempted"
 			elseif not (entry.health or entry.mana) then state = "no restore line"
 			else
