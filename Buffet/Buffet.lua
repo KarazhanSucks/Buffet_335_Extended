@@ -89,8 +89,8 @@ local function ParseRestoreLine(text, out)
 		end
 	end
 
-	Add("health", text:match("([%d,%.]+)%% of your health"), true)
-	Add("mana", text:match("([%d,%.]+)%% of your mana"), true)
+	Add("health", text:match("([%d,%.]+)%% of your health") or text:match("([%d,%.]+)%% of health"), true)
+	Add("mana", text:match("([%d,%.]+)%% of your mana") or text:match("([%d,%.]+)%% of mana"), true)
 	Add("health", text:match("restores ([%d,%.]+) health"))
 	Add("mana", text:match("restores ([%d,%.]+) mana") or text:match("and ([%d,%.]+) mana"))
 end
@@ -345,12 +345,33 @@ local function ForEachCandidate(func)
 end
 
 
+-- A percentage with no pool to measure it against (a warrior's mana, say) still
+-- has a rate worth seeing, it just isn't in a unit any pick can compare, so it
+-- reads as %/s instead of /s.
+local function PercentRate(entry)
+	if not entry.isPercent or not entry.divisor or entry.divisor <= 0 then return end
+	return entry.amount / entry.divisor
+end
+
+
 local function RateString(id, kind)
 	local entry = parsed[id] and parsed[id][kind]
 	if not entry then return "-" end
 	local rate = RateOf(entry, scanMax[kind])
-	if not rate then return "no duration" end
-	return string.format("%.1f/s", rate)
+	if rate then return string.format("%.1f/s", rate) end
+	local pct = PercentRate(entry)
+	-- RateOf only refuses a percentage when the pool is missing (0 or absent),
+	-- so a rate here means there was nothing to convert against.
+	if pct then return string.format("%.2f%%/s (no %s pool)", pct, kind) end
+	return "no duration"
+end
+
+
+-- Which mechanism decided a pick: the rate comparison, or the pool order the
+-- macro has always used.  Saying it beats inferring it from the ids.
+local function Decided(kind, id)
+	if not id then return "" end
+	return ratebest[kind].id == id and " [rate]" or " [legacy]"
 end
 
 
@@ -360,7 +381,17 @@ function Buffet:Dump()
 	local cands = {}
 	ForEachCandidate(function(id, link, stack) cands[#cands+1] = {id = id, link = link, stack = stack} end)
 
-	self:Print("prefer speed "..(self.db.preferSpeed and "ON" or "OFF").." | level "..UnitLevel("player").." | maxHP "..tostring(scanMax.health).." | maxMP "..tostring(scanMax.mana)..(InCombatLockdown() and " | in combat, macros not rescanned" or ""))
+	-- A missing pool doesn't suppress the report: without it percentages can't be
+	-- converted, which is worth saying outright rather than leaving the mana side
+	-- looking empty for a character that simply has no mana.
+	local poolnotes = ""
+	for _, kind in ipairs{"health", "mana"} do
+		if not scanMax[kind] or scanMax[kind] <= 0 then
+			poolnotes = poolnotes.." | no "..kind.." pool: percent "..kind.." items show as %/s and are left out of the rate pick"
+		end
+	end
+
+	self:Print("prefer speed "..(self.db.preferSpeed and "ON" or "OFF").." | level "..UnitLevel("player").." | maxHP "..tostring(scanMax.health).." | maxMP "..tostring(scanMax.mana)..poolnotes..(InCombatLockdown() and " | in combat, macros not rescanned" or ""))
 
 	-- Control read: the hearthstone, an item every client has.  If this comes back
 	-- empty as well then the tooltip can't be read at all on this client, rather
@@ -388,31 +419,51 @@ function Buffet:Dump()
 				state = table.concat(bits, ", ")
 			end
 			self:Print(string.format("#%d %s x%d [%s] %s | hp %s | mp %s", c.id, GetItemInfo(c.link) or "?", c.stack, POOLNAME[c.id], state, RateString(c.id, "health"), RateString(c.id, "mana")))
-			if entry and not (entry.health or entry.mana) then
-				for _, line in ipairs(entry.lines) do self:Print("    | "..line) end
+			-- Show the raw tooltip whenever something the item's pools promise is
+			-- missing, not just when nothing parsed at all: that text is the only
+			-- way to tell a stale table entry (the item never had that resource)
+			-- from a pattern that still needs work.
+			if entry then
+				local unexplained = not (entry.health or entry.mana)
+				if not unexplained then
+					for kind in pairs(RATEPOOL[c.id]) do
+						if not entry[kind] then unexplained = true end
+					end
+				end
+				if unexplained then
+					for _, line in ipairs(entry.lines) do self:Print("    | "..line) end
+				end
 			end
 		end
 	end
 
 	for _, kind in ipairs{"health", "mana"} do
-		local ranked = {}
+		local ranked, unrated = {}, {}
 		for _, c in ipairs(cands) do
 			local rp = RATEPOOL[c.id]
 			local entry = rp and rp[kind] and parsed[c.id] and parsed[c.id][kind]
 			local rate = entry and RateOf(entry, scanMax[kind])
-			if rate then ranked[#ranked+1] = {id = c.id, rate = rate} end
+			if rate then
+				ranked[#ranked+1] = {id = c.id, rate = rate}
+			elseif entry then
+				-- parsed, but this character's pool can't rate it
+				local pct = PercentRate(entry)
+				unrated[#unrated+1] = string.format("#%d %s", c.id, pct and string.format("%.2f%%/s", pct) or "no duration")
+			end
 		end
 		table.sort(ranked, function(a, b) return a.rate > b.rate end)
 		local bits = {}
 		for i = 1, math.min(#ranked, 4) do bits[#bits+1] = string.format("#%d %.1f/s", ranked[i].id, ranked[i].rate) end
-		self:Print(kind.." by rate: "..(#bits > 0 and table.concat(bits, " > ") or "(nothing parseable)"))
+		local line = kind.." by rate: "..(#bits > 0 and table.concat(bits, " > ") or "(nothing rateable)")
+		if #unrated > 0 then line = line.." | parsed, needs a "..kind.." pool: "..table.concat(unrated, ", ") end
+		self:Print(line)
 	end
 
 	self:Print("legacy order: hp "..tostring(bests.conjfood.id or bests.percfood.id or bests.food.id).." | mp "..tostring(bests.conjwater.id or bests.percwater.id or bests.water.id))
 	if lastargs then
-		self:Print(string.format("picked: food %s pot %s stone %s bandage %s | water %s mstone %s mppot %s",
-			tostring(lastargs.hp), tostring(lastargs.hppot), tostring(lastargs.hstone), tostring(lastargs.bandage),
-			tostring(lastargs.mp), tostring(lastargs.mstone), tostring(lastargs.mppot)))
+		self:Print(string.format("picked: food %s%s pot %s stone %s bandage %s | water %s%s mstone %s mppot %s",
+			tostring(lastargs.hp), Decided("health", lastargs.hp), tostring(lastargs.hppot), tostring(lastargs.hstone), tostring(lastargs.bandage),
+			tostring(lastargs.mp), Decided("mana", lastargs.mp), tostring(lastargs.mstone), tostring(lastargs.mppot)))
 	end
 end
 
